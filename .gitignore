@@ -1,0 +1,25 @@
+# Environment variables (secrets)
+.env
+
+# Python cache & temp files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.venv/
+
+# Logs & DB (untuk bot-mu)
+*.log
+scans.db
+*.tmp
+
+# OS generated files
+.DS_Store
+Thumbs.db
+
+# IDE files
+.vscode/
+.idea/
