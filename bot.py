@@ -6,7 +6,6 @@ import re
 import time
 from dotenv import load_dotenv
 
-# Load token & API Key dari file .env
 load_dotenv()
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 VT_API_KEY = os.getenv("VT_API_KEY")
@@ -14,14 +13,14 @@ VT_API_KEY = os.getenv("VT_API_KEY")
 intents = discord.Intents.default()
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# Pola mencurigakan untuk file teks
+
 SUSPICIOUS_KEYWORDS = [
     "os.execute", "io.popen", "require('socket')", "http.", "fetch", "token",
     "keyboard", "keylog", "getkeystate", "onkeyup", "onkeydown", "winapi",
     "loadstring", "base64", "post", "url", "discord"
 ]
 
-# Pola API mencurigakan untuk file binary
+
 SUSPICIOUS_BIN_PATTERNS = [
     "GetAsyncKeyState", "SendInput", "WriteFile", "CreateFile", "HttpSend",
     "InternetOpen", "InternetConnect", "WinHttp", "Keylogger", "Discord"
@@ -125,3 +124,4 @@ async def scan(ctx):
     os.remove(filepath)
 
 bot.run(DISCORD_TOKEN)
+
