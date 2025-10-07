@@ -1,4 +1,3 @@
-# bot.py (Harmony Guardian v2.7.0 final)
 import os
 import re
 import io
