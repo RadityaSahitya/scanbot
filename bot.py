@@ -1,3 +1,4 @@
+# bot.py (final - ditambahkan deteksi tujuan file)
 import discord
 from discord.ext import commands
 import requests
@@ -35,10 +36,11 @@ if not DISCORD_TOKEN:
 # Intents & Bot
 intents = discord.Intents.default()
 intents.message_content = True
+intents.members = True
 bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
 
 # Supported
-SUPPORTED_EXTS = {".lua", ".txt", ".zip", ".7z", ".rar", ".py", ".js", ".php"}
+SUPPORTED_EXTS = {".lua", ".txt", ".zip", ".7z", ".rar", ".py", ".js", ".php", ".luac", ".asi"}
 MAX_SIZE = 5 * 1024 * 1024  # 5MB
 MAX_ARCHIVE_FILES = 10
 DANGER_LEVELS = {"SAFE": "🟢", "SUSPICIOUS": "🟡", "VERY SUSPICIOUS": "🟠", "DANGEROUS": "🔴"}
@@ -59,7 +61,8 @@ ongoing_scans = set()
 # Static patterns
 SUSPICIOUS_KEYWORDS = [
     "os.execute", "io.popen", "token", "keylog", "base64", "discord.com/api/webhooks",
-    "SetWindowsHookEx", "keybd_event", "sampGetCurrentServerAddress"
+    "SetWindowsHookEx", "keybd_event", "sampGetCurrentServerAddress", "GetAsyncKeyState",
+    "CreateFile", "WriteFile", "InternetOpenUrlA", "HttpSendRequest", "MapVirtualKey"
 ]
 EXPLANATION_MAP = {
     "SetWindowsHookEx": "Memantau input keyboard/mouse, sering digunakan untuk keylogger.",
@@ -68,55 +71,151 @@ EXPLANATION_MAP = {
     "keylog": "Kode untuk mencatat input keyboard, berisiko mencuri data sensitif.",
     "token": "Mencuri token login, sering digunakan untuk hack akun.",
     "base64": "Menyembunyikan kode, sering dipakai malware untuk sembunyi.",
-    "discord.com/api/webhooks": "Mengirim data ke Discord, bisa untuk curi info akun."
+    "discord.com/api/webhooks": "Mengirim data ke Discord, bisa untuk curi info akun.",
+    "GetAsyncKeyState": "Memantau status tombol keyboard — indikasi keylogger.",
+    "CreateFile": "Fungsi buat buka/tulis file — bisa dipakai stealer/dropper.",
+    "WriteFile": "Menulis ke file — bisa membuat file log/data curian.",
+    "InternetOpenUrlA": "Memungkinkan program mengirim/mengambil data lewat HTTP.",
+    "HttpSendRequest": "Dikirim ke server eksternal — kemungkinan exfiltration."
 }
 
-def static_scan(content):
-    issues = []
-    for kw in SUSPICIOUS_KEYWORDS:
-        if kw.lower() in content.lower():
-            issues.append(f"{kw}: {EXPLANATION_MAP.get(kw, 'Kode mencurigakan.')}")
-    score = len(issues)
-    if score == 0:
-        return "SAFE", 0, "Tidak ada pola mencurigakan."
-    elif score <= 2:
-        return "SUSPICIOUS", 80, f"Deteksi {score} pola: {' | '.join(issues)}"
-    else:
-        return "DANGEROUS", 95, f"Berisiko tinggi: {score} pola terdeteksi."
+# PURPOSE mapping (heuristic)
+PURPOSE_MAP = {
+    "keylogger": ["GetAsyncKeyState", "SetWindowsHookEx", "keylog", "keybd_event", "keyboard.read_key"],
+    "stealer": ["CreateFile", "WriteFile", "sampGetCurrentServerAddress", "discord.com/api/webhooks", "token"],
+    "exfiltration": ["InternetOpenUrlA", "HttpSendRequest", "socket.connect", "fetch", "send"],
+    "obfuscation": ["base64", "eval", "loadstring", "decode"],
+    "rce": ["os.execute", "io.popen", "system", "exec", "subprocess"],
+    "rat": ["socket.connect", "bind", "listen", "accept"]
+}
 
-# VT integration
-def vt_scan(filepath):
+def detect_purpose(static_findings_text, ai_explanation_text, vt_stats):
+    """
+    Heuristic function to decide the likely purpose of a file.
+    Uses static findings (text), AI explanation and virus total stats.
+    Returns (purpose_text, confidence_score)
+    """
+    text = (static_findings_text or "") + " " + (ai_explanation_text or "")
+    text_l = text.lower()
+    counts = {}
+    for purpose, keys in PURPOSE_MAP.items():
+        for k in keys:
+            if k.lower() in text_l:
+                counts[purpose] = counts.get(purpose, 0) + 1
+
+    # Weight by VT malicious detection
+    vt_score = 0
+    try:
+        vt_mal = vt_stats.get("malicious", 0)
+        vt_susp = vt_stats.get("suspicious", 0)
+        vt_score = vt_mal * 3 + vt_susp * 1
+    except:
+        vt_score = 0
+
+    if counts:
+        # choose highest count purpose
+        chosen = max(counts.items(), key=lambda kv: kv[1])[0]
+        base_conf = min(95, 40 + counts[chosen]*20 + vt_score*5)
+        # Friendly verbose purpose
+        purpose_map_friendly = {
+            "keylogger": "Keylogger / Merekam penekanan tombol",
+            "stealer": "Pengambil data (stealer) — mencoba akses/ambil file atau token",
+            "exfiltration": "Pengiriman/Exfiltrasi data ke server eksternal",
+            "obfuscation": "Kode terobfuskasi/encoded (mencurigakan)",
+            "rce": "Remote command execution (jalankan perintah sistem)",
+            "rat": "Remote Access Trojan (kontrol jarak jauh)"
+        }
+        return purpose_map_friendly.get(chosen, chosen), int(base_conf)
+    else:
+        # fallback: if VT shows malicious, say generic data theft / malware
+        if vt_score > 0:
+            conf = min(95, 30 + vt_score*10)
+            return "Malware / Berbahaya (menunjukkan deteksi VT)", int(conf)
+        return "Tidak jelas / fungsi normal kemungkinan besar", 30
+
+# ========== STATIC FILE SCAN ==========
+def static_scan(filepath):
+    suspicious_found = []
+    ext = os.path.splitext(filepath)[1].lower()
+    content_text = ""
+    try:
+        if ext in [".lua", ".cleo", ".moonloader", ".cs", ".txt", ".asi", ".py", ".js"]:
+            with open(filepath, "r", errors="ignore") as f:
+                lines = f.readlines()
+                for i, line in enumerate(lines, start=1):
+                    content = line.strip()
+                    content_lower = content.lower()
+
+                    # Basic keywords
+                    for kw in SUSPICIOUS_KEYWORDS:
+                        if kw.lower() in content_lower:
+                            reason = EXPLANATION_MAP.get(kw, "Pola ini sering dipakai dalam malware.")
+                            suspicious_found.append((i, kw, content.strip(), reason))
+
+                    # Advanced patterns (categories)
+                    for category, patterns in PURPOSE_MAP.items():
+                        for p in patterns:
+                            if p.lower() in content_lower:
+                                reason = EXPLANATION_MAP.get(p, f"Indikasi {category}.")
+                                suspicious_found.append((i, p, content.strip(), reason))
+                content_text = "".join(lines)
+        else:
+            # Binary scan (extract readable ascii)
+            with open(filepath, "rb") as f:
+                raw = f.read()
+            content_chunks = re.findall(b"[ -~]{4,}", raw)
+            text = "\n".join([c.decode(errors="ignore") for c in content_chunks])
+            content_text = text
+            for category, patterns in PURPOSE_MAP.items():
+                for p in patterns:
+                    if p.lower() in text.lower():
+                        suspicious_found.append((0, p, "<binary>", EXPLANATION_MAP.get(p, f"Indikasi {category}.")))
+            for kw in SUSPICIOUS_KEYWORDS:
+                if kw.lower() in text.lower():
+                    suspicious_found.append((0, kw, "<binary>", EXPLANATION_MAP.get(kw, "API mencurigakan.")))
+    except Exception as e:
+        logger.error(f"Static scan read error: {e}")
+        suspicious_found.append((-1, "Error", str(e), "Gagal membaca file untuk analisis."))
+
+    return suspicious_found, content_text
+
+# ========== VIRUSTOTAL ==========
+def scan_with_virustotal(filepath):
     if not VT_API_KEY:
-        return 0, "VirusTotal tidak tersedia."
+        return None
     try:
         url = "https://www.virustotal.com/api/v3/files"
         headers = {"x-apikey": VT_API_KEY}
         with open(filepath, "rb") as f:
             files = {"file": (os.path.basename(filepath), f)}
-            response = requests.post(url, headers=headers, files=files)
+            response = requests.post(url, headers=headers, files=files, timeout=30)
         if response.status_code == 200:
-            analysis_id = response.json()["data"]["id"]
-            result = get_vt_result(analysis_id)
-            if result:
-                stats = result["data"]["attributes"]["stats"]
-                mal = stats.get("malicious", 0)
-                return mal, f"Malicious: {mal}, Suspicious: {stats.get('suspicious', 0)}"
-        return 0, "Gagal memindai VirusTotal."
+            return response.json()["data"]["id"]
+        logger.warning(f"VT upload failed: {response.status_code} {response.text[:200]}")
     except Exception as e:
-        logger.error(f"VT error: {e}")
-        return 0, f"Error VirusTotal: {str(e)}"
-
-def get_vt_result(analysis_id):
-    url = f"https://www.virustotal.com/api/v3/analyses/{analysis_id}"
-    headers = {"x-apikey": VT_API_KEY}
-    for _ in range(3):  # Retry 3 times
-        response = requests.get(url, headers=headers)
-        if response.status_code == 200 and response.json()["data"]["attributes"]["status"] == "completed":
-            return response.json()
-        time.sleep(5)
+        logger.error(f"VT upload exception: {e}")
     return None
 
-# AI Analysts
+def get_scan_result(analysis_id):
+    if not analysis_id or not VT_API_KEY:
+        return None
+    url = f"https://www.virustotal.com/api/v3/analyses/{analysis_id}"
+    headers = {"x-apikey": VT_API_KEY}
+    for _ in range(6):  # up to ~30s
+        try:
+            response = requests.get(url, headers=headers, timeout=15)
+            if response.status_code == 200:
+                rj = response.json()
+                status = rj.get("data", {}).get("attributes", {}).get("status")
+                if status == "completed":
+                    return rj
+            time.sleep(5)
+        except Exception as e:
+            logger.error(f"VT get result error: {e}")
+            time.sleep(3)
+    return None
+
+# ========== AI Analysts (keadaan tidak diubah) ==========
 deepseek_client = OpenAI(api_key=DEEPSEEK_API_KEY, base_url="https://api.deepseek.com/v1") if DEEPSEEK_API_KEY else None
 genai.configure(api_key=GEMINI_API_KEY)
 
@@ -146,7 +245,7 @@ async def analyze_with_ai(content):
             logger.error(f"Gemini error: {e}")
     
     if not results:
-        return static_scan(content)
+        return static_scan(content)[0]  # fallback (note: returns list)
     level_votes = {}
     for level, conf, exp in results:
         level_votes[level] = level_votes.get(level, 0) + 1
@@ -164,10 +263,10 @@ def parse_ai_response(text):
     conf = int(conf_match.group(1)) if conf_match else 50
     if any(kw in text.lower() for kw in ["keylog", "setwindowshookex", "keybd_event", "sampgetcurrentserveraddress"]):
         conf = max(conf, 80)
-    explanation = text[:500].strip()
+    explanation = text[:1000].strip()
     return level, conf, explanation
 
-# Extract archive
+# ========== Extract archive ==========
 def extract_archive(filepath):
     files = []
     ext = os.path.splitext(filepath)[1].lower()
@@ -193,7 +292,7 @@ def extract_archive(filepath):
         logger.error(f"Extract error: {e}")
     return files
 
-# Core scan function
+# ========== CORE SCAN ==========
 async def do_scan(filepath, progress_msg, user_id):
     ext = os.path.splitext(filepath)[1].lower()
     is_archive = ext in {".zip", ".7z", ".rar"}
@@ -211,48 +310,64 @@ async def do_scan(filepath, progress_msg, user_id):
                 level, conf, exp = await analyze_with_ai(content)
                 sub_results.append((os.path.basename(sub), level, conf, exp))
                 os.unlink(sub)
-            except:
-                pass
+            except Exception as e:
+                logger.error(f"Subfile scan error: {e}")
             progress += (100 // len(subfiles))
             bar = "▓" * (progress // 10) + "░" * (10 - progress // 10)
             await progress_msg.edit(content=f"📦 Memindai arsip {i+1}/{len(subfiles)} [{bar}] {progress}%")
-        overall_level = max([r[1] for r in sub_results], key=lambda x: LEVEL_ORDER.index(x))
+        overall_level = max([r[1] for r in sub_results], key=lambda x: LEVEL_ORDER.index(x)) if sub_results else "SAFE"
         conf = sum([r[2] for r in sub_results]) / len(sub_results) if sub_results else 50
         explanation = f"Arsip: {len(sub_results)} file. Tingkat tertinggi: {overall_level}."
+        # Determine purpose from aggregated subresults and explanations
+        static_agg_text = " ".join([r[3] for r in sub_results])
+        purpose, pconf = detect_purpose(static_agg_text, explanation, {})
     else:
         with open(filepath, "r", errors="ignore") as f:
             content = f.read()[:4000]
         await progress_msg.edit(content="🤖 Memindai dengan AI... [▓▓▓░░░] 60%")
         level, conf, ai_exp = await analyze_with_ai(content)
         await progress_msg.edit(content="🧪 Memindai pola & VT... [▓▓▓▓▓░] 80%")
-        static_level, static_conf, static_exp = static_scan(content)
-        vt_mal, vt_exp = vt_scan(filepath)
-        levels = [level, static_level]
-        if vt_mal > 0:
+        static_findings, static_text = static_scan(filepath)
+        # vt
+        analysis_id = scan_with_virustotal(filepath)
+        vt_stats = {"malicious": 0, "suspicious": 0, "undetected": 0}
+        vt_text = "VirusTotal tidak tersedia."
+        if analysis_id:
+            # blocking wait: acceptable for now (existing pattern)
+            time.sleep(5)
+            res = get_scan_result(analysis_id)
+            if res:
+                stats = res["data"]["attributes"]["stats"]
+                vt_stats = {"malicious": stats.get("malicious", 0), "suspicious": stats.get("suspicious", 0), "undetected": stats.get("undetected", 0)}
+                vt_text = f"Malicious: {vt_stats['malicious']}, Suspicious: {vt_stats['suspicious']}, Clean: {vt_stats['undetected']}"
+        else:
+            vt_text = "Gagal upload ke VirusTotal atau API key tidak tersedia."
+        # Determine overall level
+        levels = [level]
+        if static_findings:
+            # map static findings to at least SUSPICIOUS
+            levels.append("SUSPICIOUS")
+        if vt_stats.get("malicious", 0) > 0:
             levels.append("DANGEROUS")
         overall_level = max(levels, key=lambda x: LEVEL_ORDER.index(x))
-        conf = max(conf, static_conf, 80 if vt_mal > 0 else 0)
-        explanation = f"**AI**: {ai_exp}\n**Pola**: {static_exp}\n**VT**: {vt_exp}"
-    
-    if any(kw in explanation.lower() for kw in ["keylog", "setwindowshookex", "keybd_event", "sampgetcurrentserveraddress"]):
+        # Confidence heuristics
+        conf = max(conf if isinstance(conf, (int, float)) else 50, 80 if vt_stats.get("malicious", 0) > 0 else 0)
+        # explanation
+        explanation = f"AI: {ai_exp}\nStatic: {static_findings[:3]}\nVT: {vt_text}"
+        purpose, pconf = detect_purpose(" ".join([f[3] for f in static_findings]) if static_findings else static_text, ai_exp, vt_stats)
+
+    # bump danger if certain keywords present
+    if any("keylog" in (s[1].lower() if isinstance(s, tuple) else str(s).lower()) for s in static_findings):
         overall_level = max(overall_level, "DANGEROUS", key=lambda x: LEVEL_ORDER.index(x))
-        conf = max(conf, 80)
+        conf = max(conf, 85)
 
-    purpose = "Tidak jelas."
-    if "sampGetCurrentServerAddress" in explanation.lower():
-        purpose = "Mencuri data peta game (posisi, material, bangunan)."
-    elif any(kw in explanation.lower() for kw in ["keylog", "setwindowshookex", "keybd_event"]):
-        purpose = "Merekam input keyboard untuk mencuri data sensitif."
-    elif "token" in explanation.lower():
-        purpose = "Mencuri token login untuk hack akun."
-    elif "base64" in explanation.lower():
-        purpose = "Menyembunyikan kode, kemungkinan malware."
-
+    # Save to DB
     result_json = json.dumps({"level": overall_level, "confidence": conf, "explanation": explanation, "purpose": purpose})
     cursor.execute("INSERT INTO scans VALUES (?, ?, ?, ?, ?, ?, ?)",
-                   (user_id, os.path.basename(filepath), "auto", result_json, overall_level, datetime.datetime.now().isoformat(), conf))
+                   (user_id, os.path.basename(filepath), "auto", result_json, overall_level, datetime.datetime.now().isoformat(), int(conf)))
     conn.commit()
 
+    # Build output report files
     report = {
         "file": os.path.basename(filepath),
         "level": overall_level,
@@ -262,14 +377,17 @@ async def do_scan(filepath, progress_msg, user_id):
         "subfiles": [{"name": r[0], "level": r[1], "conf": r[2]} for r in sub_results] if is_archive else []
     }
     json_report = json.dumps(report, indent=2)
-    txt_report = f"┌───────────────── Raxt Community Scanner ─────────────────┐\n" \
-                 f"│ {DANGER_LEVELS.get(overall_level, '🟡')} **Status**: {overall_level}                        │\n" \
-                 f"│ 💾 **File**: {os.path.basename(filepath)}                         │\n" \
-                 f"│ 📊 **Skor**: {conf:.1f}%                                  │\n" \
-                 f"│ 🎯 **Tujuan**: {purpose}                          │\n" \
-                 f"│ 📝 **Penjelasan**: {explanation[:400]}...                │\n" \
-                 f"{'│ 📂 **File dalam Arsip**: ' + ', '.join([r[0] + f' ({r[1]})' for r in sub_results]) + ' ' * (50 - len(', '.join([r[0] + f' ({r[1]})' for r in sub_results]))) + '│' if is_archive else ''}" \
-                 f"└───────────────── Powered by Raxt Community ─────────────┘"
+    txt_report = (
+        f"┌───────────────── Raxt Community Scanner ─────────────────┐\n"
+        f"│ {DANGER_LEVELS.get(overall_level, '🟡')} **Status**: {overall_level}                        │\n"
+        f"│ 💾 **File**: {os.path.basename(filepath)}                         │\n"
+        f"│ 📊 **Skor**: {conf:.1f}%                                  │\n"
+        f"│ 🎯 **Tujuan (Purpose)**: {purpose}                          │\n"
+        f"│ 📝 **Penjelasan**: {explanation[:400]}...                │\n"
+    )
+    if sub_results:
+        txt_report += "│ 📂 **File dalam Arsip**: " + ', '.join([r[0] + f' ({r[1]})' for r in sub_results]) + "\n"
+    txt_report += "└───────────────── Powered by Raxt Community ─────────────┘"
 
     with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False, encoding='utf-8') as jf:
         jf.write(json_report)
@@ -280,7 +398,7 @@ async def do_scan(filepath, progress_msg, user_id):
 
     return overall_level, conf, purpose, explanation, [json_path, txt_path], sub_results
 
-# Button interaction
+# Button interaction (unchanged)
 class ScanButtons(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
@@ -336,17 +454,21 @@ class ScanButtons(discord.ui.View):
         embed.set_footer(text="🌟 Dibuat oleh Raxt Community")
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
-# Commands
+# Commands (scan, history, help) - scanned code adapted to use new purpose
 @bot.command()
 @commands.cooldown(1, 40, commands.BucketType.user)
 async def scan(ctx_or_msg, url: str = None):
+    # Support both context and message forwarded usage (as before)
     if isinstance(ctx_or_msg, discord.Message):
         channel = ctx_or_msg.channel
         user_id = ctx_or_msg.author.id
+        context = None
     else:
         channel = ctx_or_msg.channel
         user_id = ctx_or_msg.author.id
+        context = ctx_or_msg
 
+    # Rate limiting per day
     today = datetime.date.today().isoformat()
     cursor.execute("SELECT scans_today FROM stats WHERE user_id=? AND last_reset=?", (user_id, today))
     row = cursor.fetchone()
@@ -371,46 +493,48 @@ async def scan(ctx_or_msg, url: str = None):
             progress_msg = await ctx_or_msg.send("⏳ Memulai scan...")
 
         filepath = None
+        filename = None
+        # handle URL or attachment as before...
         if url:
             filename = url.split('/')[-1] or "file.lua"
             filepath = await download_from_url(url, filename)
             if not filepath:
                 await progress_msg.edit(content="❌ Gagal mengunduh dari URL!")
+                ongoing_scans.discard(user_id)
                 return
             await progress_msg.edit(content=f"📥 Berhasil mengunduh {os.path.basename(filepath)}")
-        elif isinstance(ctx_or_msg, discord.Message) and ctx_or_msg.attachments:
-            attachment = ctx_or_msg.attachments[0]
-            if attachment.size > MAX_SIZE or os.path.splitext(attachment.filename)[1].lower() not in SUPPORTED_EXTS:
-                await progress_msg.edit(content="❌ File tidak didukung atau terlalu besar (maks 5MB)!")
-                return
-            with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(attachment.filename)[1]) as tmp:
-                filepath = tmp.name
-            await attachment.save(filepath)
-            await progress_msg.edit(content=f"📂 Memuat {attachment.filename}")
-        elif isinstance(ctx_or_msg, discord.ext.commands.Context) and ctx_or_msg.message.attachments:
-            attachment = ctx_or_msg.message.attachments[0]
-            if attachment.size > MAX_SIZE or os.path.splitext(attachment.filename)[1].lower() not in SUPPORTED_EXTS:
-                await progress_msg.edit(content="❌ File tidak didukung atau terlalu besar (maks 5MB)!")
-                return
-            with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(attachment.filename)[1]) as tmp:
-                filepath = tmp.name
-            await attachment.save(filepath)
-            await progress_msg.edit(content=f"📂 Memuat {attachment.filename}")
         else:
-            await progress_msg.edit(content="❌ Harap unggah file atau berikan URL!")
-            return
+            # check attachments from ctx_or_msg or context
+            msg_obj = ctx_or_msg if isinstance(ctx_or_msg, discord.Message) else ctx_or_msg.message
+            if not msg_obj.attachments:
+                await progress_msg.edit(content="❌ Harap unggah file atau berikan URL!")
+                ongoing_scans.discard(user_id)
+                return
+            attachment = msg_obj.attachments[0]
+            if attachment.size > MAX_SIZE or os.path.splitext(attachment.filename)[1].lower() not in SUPPORTED_EXTS:
+                await progress_msg.edit(content="❌ File tidak didukung atau terlalu besar (maks 5MB)!")
+                ongoing_scans.discard(user_id)
+                return
+            with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(attachment.filename)[1]) as tmp:
+                filepath = tmp.name
+            await attachment.save(filepath)
+            filename = attachment.filename
+            await progress_msg.edit(content=f"📂 Memuat {filename}")
 
+        # Run scan
         level, conf, purpose, explanation, report_paths, sub_results = await do_scan(filepath, progress_msg, user_id)
         await progress_msg.edit(content="✅ Scan selesai! [▓▓▓▓▓▓] 100%")
 
         color_map = {"SAFE": 0x00ff00, "SUSPICIOUS": 0xffff00, "VERY SUSPICIOUS": 0xffa500, "DANGEROUS": 0xff0000}
         embed = discord.Embed(
             title=f"┌── {DANGER_LEVELS.get(level, '🟡')} Raxt Community: Hasil Scan ──┐",
-            description=f"│ 💾 **File**: {os.path.basename(filepath)} │\n"
-                        f"│ 📊 **Skor**: {conf:.1f}% │\n"
-                        f"│ 🎯 **Tujuan**: {purpose} │\n"
-                        f"│ 📝 **Penjelasan**: {explanation[:400]}... │\n"
-                        f"└────────────────────────────┘",
+            description=(
+                f"**File**: `{os.path.basename(filepath)}`\n"
+                f"**Status**: {DANGER_LEVELS.get(level, '🟡')} **{level}**\n"
+                f"**Confidence**: {conf:.1f}%\n"
+                f"**Purpose (tujuan)**: {purpose}\n\n"
+                f"**Ringkasan**: {explanation[:350]}..."
+            ),
             color=color_map.get(level, 0x00b7eb),
             timestamp=datetime.datetime.now()
         )
@@ -420,10 +544,12 @@ async def scan(ctx_or_msg, url: str = None):
                 value="\n".join([f"{DANGER_LEVELS.get(r[1], '🟡')} {r[0]}: {r[1]} ({r[2]}%)" for r in sub_results]),
                 inline=False
             )
-        embed.set_footer(text="🌟 Dibuat oleh Raxt Community")
+        # Attach JSON + TXT report if exist
         files = [discord.File(p, os.path.basename(p)) for p in report_paths if os.path.exists(p)]
+        embed.set_footer(text=f"🌟 Dibuat oleh Raxt Community | Dipindai pada {datetime.datetime.now().strftime('%A, %d %B %Y • %H:%M:%S')}")
         await progress_msg.edit(content=None, embed=embed, attachments=files, view=ScanButtons())
 
+        # cleanup
         for p in report_paths:
             if os.path.exists(p):
                 os.unlink(p)
@@ -439,6 +565,7 @@ async def scan(ctx_or_msg, url: str = None):
     finally:
         ongoing_scans.discard(user_id)
 
+# error handler and other commands (history, help) remain similar to previous script
 @scan.error
 async def scan_error(ctx, error):
     if isinstance(error, commands.CommandOnCooldown):
@@ -473,65 +600,56 @@ async def history(ctx, limit: int = 5):
 
 @bot.command()
 async def help(ctx):
+    guild = ctx.guild
+    total_members = guild.member_count if guild else "Unknown"
+    online_members = sum(1 for m in guild.members if m.status != discord.Status.offline) if guild else "Unknown"
     embed = discord.Embed(
         title="┌── 🛡️ Raxt Community Scanner: Bantuan ──┐",
         description="🔒 Bot keamanan untuk memindai file Lua/mod, dibuat oleh **Raxt Community**.",
         color=0x00b7eb
     )
     embed.add_field(
+        name="👥 Statistik Server",
+        value=f"Total Member: **{total_members}** | Online: **{online_members}**",
+        inline=False
+    )
+    embed.add_field(
         name="🔍 Cara Pakai",
-        value="┌────────────────────────────┐\n"
-              "│ **Upload File**: Ketik !scan lalu unggah file. │\n"
-              "│ **URL**: !scan <URL>                     │\n"
-              "│ **Otomatis**: Unggah file di channel.    │\n"
-              "└────────────────────────────┘",
+        value="• **Upload File**: Ketik `!scan` lalu unggah file.\n• **URL**: `!scan <URL>`\n• **Otomatis**: Unggah file di channel yang diizinkan.",
         inline=False
     )
     embed.add_field(
         name="⚙️ Perintah",
-        value="┌────────────────────────────┐\n"
-              "│ !scan       - Scan file/URL         │\n"
-              "│ !history [n]- Lihat riwayat scan    │\n"
-              "│ !help       - Tampilkan bantuan     │\n"
-              "└────────────────────────────┘",
-        inline=False
-    )
-    embed.add_field(
-        name="📁 File Didukung",
-        value="┌────────────────────────────┐\n"
-              "│ **Format**: .lua, .txt, .zip, dll   │\n"
-              "│ **Maks**: 5MB                      │\n"
-              "│ **Arsip**: Maks 10 file            │\n"
-              "└────────────────────────────┘",
-        inline=False
-    )
-    embed.add_field(
-        name="🚨 Tingkat Bahaya",
-        value="┌────────────────────────────┐\n"
-              "│ 🟢 **Aman**                 │\n"
-              "│ 🟡 **Mencurigakan**         │\n"
-              "│ 🟠 **Sangat Mencurigakan**  │\n"
-              "│ 🔴 **Berbahaya**            │\n"
-              "└────────────────────────────┘",
+        value="`!scan` - Scan file/URL\n`!history [n]` - Lihat riwayat scan\n`!help` - Tampilkan bantuan",
         inline=False
     )
     embed.set_footer(text="🌟 Dibuat oleh Raxt Community")
     await ctx.send(embed=embed, view=ScanButtons())
 
+# on_ready: presence + post welcome embed to allowed channels
 @bot.event
 async def on_ready():
     logger.info(f"✅ Bot aktif sebagai {bot.user}")
+    await bot.change_presence(activity=discord.Game(name="🔍 Scanning files safely with Raxt Community"), status=discord.Status.online)
     for guild in bot.guilds:
+        online_members = sum(1 for m in guild.members if m.status != discord.Status.offline)
+        total_members = guild.member_count
+        embed = discord.Embed(
+            title="🛡️ Raxt Community Scanner Aktif!",
+            description=(
+                "🧩 Creating channels that are temporary.\n"
+                "⚙️ Configurable with a beautiful dashboard.\n\n"
+                f"👥 **{total_members} Members** | 🟢 **{online_members} Online**\n\n"
+                "Gunakan tombol di bawah untuk mulai scan file atau melihat bantuan!"
+            ),
+            color=0x00b7eb
+        )
+        embed.set_footer(text="🌟 Dibuat oleh Raxt Community")
         for channel in guild.text_channels:
             if channel.id in ALLOWED_CHANNELS:
-                embed = discord.Embed(
-                    title="🛡️ Raxt Community Scanner Aktif!",
-                    description="🔒 Klik tombol di bawah untuk memindai file atau melihat bantuan.",
-                    color=0x00b7eb
-                )
-                embed.set_footer(text="🌟 Dibuat oleh Raxt Community")
                 await channel.send(embed=embed, view=ScanButtons())
 
+# on_message auto-scan (unchanged)
 @bot.event
 async def on_message(message):
     if message.author.bot:
@@ -541,6 +659,7 @@ async def on_message(message):
         await scan(message, url=None)
     await bot.process_commands(message)
 
+# helper: download_from_url (as before)
 async def download_from_url(url, filename):
     try:
         if "github.com" in url and "/blob/" in url:
@@ -560,6 +679,7 @@ async def download_from_url(url, filename):
         logger.error(f"URL download error: {e}")
     return None
 
+# global command error handling
 @bot.event
 async def on_command_error(ctx, error):
     if isinstance(error, commands.CommandNotFound):
